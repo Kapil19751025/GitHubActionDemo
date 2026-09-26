@@ -1,0 +1,15 @@
+name: Configure VLANs on Network Device
+hosts: switches
+gather_facts: no
+connection: network_cli
+tasks:
+name: Create VLAN 10 for Data
+cisco.ios.ios_vlan:
+vlan_id: 10
+name: DATA_VLAN
+state: present
+name: Create VLAN 20 for Voice
+cisco.ios.ios_vlan:
+vlan_id: 20
+name: VOICE_VLAN
+state: present
