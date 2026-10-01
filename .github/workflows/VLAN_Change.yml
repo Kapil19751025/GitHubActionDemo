@@ -1,0 +1,178 @@
+name: VLAN Change Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      change_number:
+        description: "Approved ServiceNow change number"
+        required: true
+        type: string
+      site:
+        description: "Approved target site"
+        required: true
+        type: string
+      target_group:
+        description: "Approved inventory group"
+        required: true
+        type: string
+      vlan_id:
+        description: "VLAN ID"
+        required: true
+        type: string
+      vlan_name:
+        description: "VLAN name"
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: vlan-${{ inputs.site }}-${{ inputs.target_group }}
+  cancel-in-progress: false
+env:
+  CHANGE_NUMBER: ${{ inputs.change_number }}
+  ARTIFACT_DIR: artifacts/${{ inputs.change_number }}
+jobs:
+  authorize_and_validate:
+    name: G0-G2 | Authorize and validate intent
+    runs-on: [self-hosted, linux, network-automation]
+    steps:
+      - name: Check out approved automation
+        uses: actions/checkout@v4
+      - name: Create artifact directory
+        run: mkdir -p "$ARTIFACT_DIR"
+      - name: Confirm ServiceNow approval and schedule
+        env:
+          SN_INSTANCE: ${{ secrets.SN_INSTANCE }}
+          SN_TOKEN: ${{ secrets.SN_TOKEN }}
+        run: |
+          python scripts/validate_change.py \
+            --change "$CHANGE_NUMBER" \
+            --output "$ARTIFACT_DIR/authorization.json"
+      - name: Validate normalized intent and target scope
+        run: |
+          python scripts/validate_intent.py \
+            --site "${{ inputs.site }}" \
+            --target-group "${{ inputs.target_group }}" \
+            --vlan-id "${{ inputs.vlan_id }}" \
+            --vlan-name "${{ inputs.vlan_name }}" \
+            --output "$ARTIFACT_DIR/intent-validation.json"
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.change_number }}-validation
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 30
+  pre_checks:
+    name: G3 | Pre-change readiness
+    needs: authorize_and_validate
+    runs-on: [self-hosted, linux, network-automation]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run backup and pre-check playbook
+        env:
+          ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          ansible-playbook playbooks/precheck_vlan.yml \
+            -l "${{ inputs.target_group }}" \
+            -e "site=${{ inputs.site }}" \
+            -e "vlan_id=${{ inputs.vlan_id }}" \
+            -e "vlan_name=${{ inputs.vlan_name }}" \
+            -e "artifact_dir=$ARTIFACT_DIR"
+      - name: Upload pre-check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.change_number }}-prechecks
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 30
+  implement:
+    name: G4-G5 | Implement approved intent
+    needs: pre_checks
+    environment: production-network
+    runs-on: [self-hosted, linux, network-automation]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply VLAN intent
+        env:
+          ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          ansible-playbook playbooks/create_vlan.yml \
+            -l "${{ inputs.target_group }}" \
+            -e "site=${{ inputs.site }}" \
+            -e "vlan_id=${{ inputs.vlan_id }}" \
+            -e "vlan_name=${{ inputs.vlan_name }}" \
+            -e "change_number=$CHANGE_NUMBER" \
+            -e "artifact_dir=$ARTIFACT_DIR"
+      - name: Upload implementation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.change_number }}-implementation
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 30
+  post_checks:
+    name: G6 | Post-change assurance
+    needs: implement
+    runs-on: [self-hosted, linux, network-automation]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify observed state against intent
+        run: |
+          mkdir -p "$ARTIFACT_DIR"
+          ansible-playbook playbooks/validate_vlan.yml \
+            -l "${{ inputs.target_group }}" \
+            -e "site=${{ inputs.site }}" \
+            -e "vlan_id=${{ inputs.vlan_id }}" \
+            -e "vlan_name=${{ inputs.vlan_name }}" \
+            -e "artifact_dir=$ARTIFACT_DIR"
+      - name: Build evidence summary
+        if: always()
+        run: python scripts/generate_report.py --input "$ARTIFACT_DIR" \
+          --output "$ARTIFACT_DIR/summary.json"
+      - name: Upload post-check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.change_number }}-postchecks
+          path: ${{ env.ARTIFACT_DIR }}
+          retention-days: 30
+
+  update_servicenow_success:
+    name: G7 | Publish success result
+    needs: post_checks
+    if: success()
+    runs-on: [self-hosted, linux, network-automation]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Post workflow result to ServiceNow
+        env:
+          SN_INSTANCE: ${{ secrets.SN_INSTANCE }}
+          SN_TOKEN: ${{ secrets.SN_TOKEN }}
+        run: |
+          python scripts/update_servicenow.py \
+            --change "$CHANGE_NUMBER" \
+            --status "implementation_complete" \
+            --conclusion "success" \
+            --run-id "${{ github.run_id }}" \
+            --commit "${{ github.sha }}"
+  update_servicenow_failure:
+    name: Publish failed or cancelled result
+    needs: [authorize_and_validate, pre_checks, implement, post_checks]
+    if: failure() || cancelled()
+    runs-on: [self-hosted, linux, network-automation]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Post failure result for manual decision
+        env:
+          SN_INSTANCE: ${{ secrets.SN_INSTANCE }}
+          SN_TOKEN: ${{ secrets.SN_TOKEN }}
+        run: |
+          python scripts/update_servicenow.py \
+            --change "$CHANGE_NUMBER" \
+            --status "implementation_review_required" \
+            --conclusion "${{ job.status }}" \
+            --run-id "${{ github.run_id }}" \
+            --commit "${{ github.sha }}"
